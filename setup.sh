@@ -44,8 +44,8 @@ usage() {
     echo "  --with-authelia      Enable or disable Authelia 2FA support"
     echo ""
     echo "Examples:"
-    echo "  $0 --proxy nginx --with-authelia    # Set up Supabase with nginx and Authelia 2FA"
-    echo "  $0 --proxy caddy                    # Set up Supabase with caddy and no 2FA"
+    echo "  $0 --proxy nginx --with-authelia   # Set up Supabase with nginx and Authelia 2FA"
+    echo "  $0 --proxy caddy                  # Set up Supabase with caddy and no 2FA"
     echo ""
     echo "For more information, visit the project repository:"
     echo "https://github.com/singh-inder/supabase-automated-self-host"
@@ -121,7 +121,7 @@ arch="$(detect_arch)"
 if [[ "$os" == "err" ]]; then error_exit "This script only supports linux os"; fi
 if [[ "$arch" == "err" ]]; then error_exit "Unsupported cpu architecture"; fi
 
-packages=(curl wget jq openssl git)
+packages=(curl wget jq openssl git ufw)
 
 # set -e doesn't work if any command is part of an if statement. package installation errors have to be checked https://stackoverflow.com/a/821419/18954618
 # https://unix.stackexchange.com/a/571192/642181
@@ -135,7 +135,7 @@ elif [ -x "$(command -v dnf)" ]; then
     dnf makecache && dnf install -y "${packages[@]}" httpd-tools
 
 elif [ -x "$(command -v zypper)" ]; then
-    zypper refresh && zypper install "${packages[@]}" apache2-utils
+    zypper refresh && zypper install -y "${packages[@]}" apache2-utils
 
 elif [ -x "$(command -v pacman)" ]; then
     pacman -Syu --noconfirm "${packages[@]}" apache
@@ -152,6 +152,60 @@ else
 fi
 
 if [ $? -ne 0 ]; then error_exit "Failed to install packages."; fi
+
+info_log "Installing Docker and Docker Compose..."
+if ! [ -x "$(command -v docker)" ]; then
+    if ! curl -fsSL https://get.docker.com -o get-docker.sh; then
+        error_exit "Failed to download Docker installation script."
+    fi
+    if ! sh get-docker.sh; then
+        error_exit "Docker installation failed."
+    fi
+    rm get-docker.sh
+
+    if [ -n "$SUDO_USER" ]; then
+        info_log "Adding user '$SUDO_USER' to the 'docker' group."
+        if ! usermod -aG docker "$SUDO_USER"; then
+            error_log "Failed to add user to the docker group. You may need to run 'docker' commands with sudo."
+        else
+            info_log "You may need to start a new shell for the group changes to take effect."
+        fi
+    fi
+
+    if [ -x "$(command -v systemctl)" ]; then
+        info_log "Enabling and starting Docker service."
+        systemctl enable docker &>/dev/null || true
+        systemctl start docker &>/dev/null || true
+    fi
+else
+    info_log "Docker is already installed. Skipping installation."
+fi
+
+if ! docker compose version &>/dev/null; then
+    error_exit "Docker Compose is not available. Please install the 'docker-compose-plugin' or ensure Docker was installed correctly."
+fi
+info_log "Docker and Docker Compose are ready."
+
+info_log "Configuring firewall with UFW..."
+if ! [ -x "$(command -v ufw)" ]; then
+    error_exit "UFW command not found. Please ensure 'ufw' is installed correctly."
+fi
+
+info_log "Allowing SSH (22/tcp), HTTP (80/tcp), and HTTPS (443/tcp) ports."
+ufw allow 22/tcp >/dev/null
+ufw allow 80/tcp >/dev/null
+ufw allow 443/tcp >/dev/null
+
+info_log "Enabling UFW."
+if ! ufw --force enable; then
+    error_exit "Failed to enable UFW."
+fi
+
+if ! ufw status | grep -q "Status: active"; then
+    error_exit "UFW is not active. Please check your system configuration."
+fi
+info_log "Firewall is active and configured."
+
 
 githubAc="https://github.com/singh-inder"
 repoUrl="$githubAc/supabase-automated-self-host"
@@ -420,12 +474,12 @@ if [[ "$proxy" == "caddy" ]]; then
 
     # BIND MOUNT VOLUMES CONFIG
     proxy_service_yaml="${proxy_service_yaml} |
-                        .services.caddy.image=\"caddy:2.10.0\" |
-                        .services.caddy.environment.DOMAIN=\"\${SUPABASE_PUBLIC_URL:?error}\" |
-                        .services.caddy.volumes=[\"$caddyfile_local:/etc/caddy/Caddyfile\",
-                                                \"$caddy_local_volume/caddy_data:/data\",
-                                                \"$caddy_local_volume/caddy_config:/config\",
-                                                \"$caddy_local_volume/snippets:$caddySnippetsPath\"]"
+                                 .services.caddy.image=\"caddy:2.10.0\" |
+                                 .services.caddy.environment.DOMAIN=\"\${SUPABASE_PUBLIC_URL:?error}\" |
+                                 .services.caddy.volumes=[\"$caddyfile_local:/etc/caddy/Caddyfile\",
+                                                        \"$caddy_local_volume/caddy_data:/data\",
+                                                        \"$caddy_local_volume/caddy_config:/config\",
+                                                        \"$caddy_local_volume/snippets:$caddySnippetsPath\"]"
 else
     update_env_vars "NGINX_SERVER_NAME=$host"
     # docker compose nginx service command directive. Passed via yq strenv
@@ -442,12 +496,12 @@ else
     # output multiline string from yq https://mikefarah.gitbook.io/yq/operators/string-operators#string-blocks-bash-and-newlines
 
     proxy_service_yaml="${proxy_service_yaml} |
-                        .services.nginx.image=\"jonasal/nginx-certbot:5.5.0-nginx1.27.5\" |
-                        .services.nginx.volumes=[\"$nginx_local_volume:/etc/nginx/user_conf.d\",\"$nginx_local_volume/letsencrypt:/etc/letsencrypt\"] |
-                        .services.nginx.environment.NGINX_SERVER_NAME = \"\${NGINX_SERVER_NAME:?error}\" |
-                        .services.nginx.environment.CERTBOT_EMAIL=\"your@email.org\" |
-                        .services.nginx.command=[\"/bin/bash\",\"-c\",strenv(nginx_cmd)]
-                       "
+                                 .services.nginx.image=\"jonasal/nginx-certbot:5.5.0-nginx1.27.5\" |
+                                 .services.nginx.volumes=[\"$nginx_local_volume:/etc/nginx/user_conf.d\",\"$nginx_local_volume/letsencrypt:/etc/letsencrypt\"] |
+                                 .services.nginx.environment.NGINX_SERVER_NAME = \"\${NGINX_SERVER_NAME:?error}\" |
+                                 .services.nginx.environment.CERTBOT_EMAIL=\"your@email.org\" |
+                                 .services.nginx.command=[\"/bin/bash\",\"-c\",strenv(nginx_cmd)]
+                                "
 
     if [[ "$CI" == true ]]; then
         # https://github.com/JonasAlfredsson/docker-nginx-certbot/blob/master/docs/advanced_usage.md#local-ca
@@ -467,9 +521,9 @@ if [[ "$with_authelia" == false ]]; then
     update_env_vars "PROXY_AUTH_USERNAME=$username" "PROXY_AUTH_PASSWORD='$password'"
 
     proxy_service_yaml="${proxy_service_yaml} | 
-                        .services.$proxy.environment.PROXY_AUTH_USERNAME = \"\${PROXY_AUTH_USERNAME:?error}\" |
-                        .services.$proxy.environment.PROXY_AUTH_PASSWORD = \"\${PROXY_AUTH_PASSWORD:?error}\"
-                        "
+                                 .services.$proxy.environment.PROXY_AUTH_USERNAME = \"\${PROXY_AUTH_USERNAME:?error}\" |
+                                 .services.$proxy.environment.PROXY_AUTH_PASSWORD = \"\${PROXY_AUTH_PASSWORD:?error}\"
+                                 "
 
     if [[ "$proxy" == "nginx" ]]; then
         # path inside nginx container for storing basic_auth credentials
@@ -497,9 +551,9 @@ if [[ "$with_authelia" == true ]]; then
                eval(strenv(yaml_path)).disabled = false' >./volumes/authelia/users_database.yml
 
     authelia_config_file_yaml='.access_control.rules[0].domain=strenv(host) | 
-            .session.cookies[0].domain=strenv(registered_domain) | 
-            .session.cookies[0].authelia_url=strenv(authelia_url) |
-            .session.cookies[0].default_redirection_url=strenv(redirect_url)'
+           .session.cookies[0].domain=strenv(registered_domain) | 
+           .session.cookies[0].authelia_url=strenv(authelia_url) |
+           .session.cookies[0].default_redirection_url=strenv(redirect_url)'
 
     server_endpoints="forward-auth"
     implementation="ForwardAuth"
@@ -519,8 +573,8 @@ if [[ "$with_authelia" == true ]]; then
        .services.authelia.image = "authelia/authelia:4.38" |
        .services.authelia.volumes = ["./volumes/authelia:/config"] |
        .services.authelia.depends_on.db.condition = "service_healthy" |
-       .services.authelia.expose = [9091] |    
-       .services.authelia.restart = "unless-stopped" |    
+       .services.authelia.expose = [9091] |   
+       .services.authelia.restart = "unless-stopped" |   
        .services.authelia.healthcheck.disable = false |
        .services.authelia.environment = {
          "AUTHELIA_STORAGE_POSTGRES_ADDRESS": "tcp://db:5432",
@@ -539,16 +593,16 @@ if [[ "$with_authelia" == true ]]; then
         authelia_config_file_yaml="${authelia_config_file_yaml}|.session.redis.host=\"redis\" | .session.redis.port=6379"
 
         authelia_docker_service_yaml="${authelia_docker_service_yaml}|.services.redis.container_name=\"redis\" |
-                    .services.redis.image=\"redis:7.4\" |
-                    .services.redis.expose=[6379] |
-                    .services.redis.volumes=[\"./volumes/redis:/data\"] |
-                    .services.redis.healthcheck={
-                    \"test\" : [\"CMD-SHELL\",\"redis-cli ping | grep PONG\"],
-                    \"timeout\" : \"5s\",
-                    \"interval\" : \"1s\",
-                    \"retries\" : 5
-                    } |
-                    .services.authelia.depends_on.redis.condition=\"service_healthy\""
+                       .services.redis.image=\"redis:7.4\" |
+                       .services.redis.expose=[6379] |
+                       .services.redis.volumes=[\"./volumes/redis:/data\"] |
+                       .services.redis.healthcheck={
+                       \"test\" : [\"CMD-SHELL\",\"redis-cli ping | grep PONG\"],
+                       \"timeout\" : \"5s\",
+                       \"interval\" : \"1s\",
+                       \"retries\" : 5
+                       } |
+                       .services.authelia.depends_on.redis.condition=\"service_healthy\""
     fi
 
     host="$host" registered_domain="$registered_domain" authelia_url="$domain"/authenticate redirect_url="$domain" \
@@ -577,8 +631,8 @@ if [[ "$proxy" == "caddy" ]]; then
         ")
 
         handle @supa_api {
-		    reverse_proxy kong:8000
-	    }
+            reverse_proxy kong:8000
+        }
 
         handle_path /storage/v1/* {
             import cors *
@@ -594,18 +648,18 @@ if [[ "$proxy" == "caddy" ]]; then
             reverse_proxy kong:8000
         }
 
-       	handle {
+        handle {
             $([[ "$with_authelia" == false ]] && echo "basic_auth {
-			    {\$PROXY_AUTH_USERNAME} {\$PROXY_AUTH_PASSWORD}
-		    }" || echo "forward_auth authelia:9091 {
-                        uri /api/authz/forward-auth
+                {\$PROXY_AUTH_USERNAME} {\$PROXY_AUTH_PASSWORD}
+            }" || echo "forward_auth authelia:9091 {
+                            uri /api/authz/forward-auth
 
-                        copy_headers Remote-User Remote-Groups Remote-Name Remote-Email
-                }")	    	
+                            copy_headers Remote-User Remote-Groups Remote-Name Remote-Email
+                    }")     
 
-		    reverse_proxy studio:3000
-	    }
-      	
+            reverse_proxy studio:3000
+        }
+        
         header -server
 }" >"$caddyfile_local"
 else
@@ -617,16 +671,16 @@ else
     # cert path inside container https://github.com/JonasAlfredsson/docker-nginx-certbot/blob/master/docs/good_to_know.md#how-the-script-add-domain-names-to-certificate-requests
     certPath="/etc/letsencrypt/live/supabase-automated-self-host"
 
-    echo "    
+    echo "      
 upstream kong_upstream {
         server kong:8000;
         keepalive 2;
 }
 
 server {
-	    listen 443 ssl;
- 	    listen [::]:443 ssl;
- 	    http2 on;
+        listen 443 ssl;
+        listen [::]:443 ssl;
+        http2 on;
         server_name \${NGINX_SERVER_NAME};
         server_tokens off;
         proxy_http_version 1.1;
@@ -639,8 +693,8 @@ server {
         proxy_set_header X-Forwarded-For \$remote_addr;
         proxy_set_header X-Real-IP \$remote_addr;
 
-        ssl_certificate         $certPath/fullchain.pem;
-        ssl_certificate_key     $certPath/privkey.pem;
+        ssl_certificate           $certPath/fullchain.pem;
+        ssl_certificate_key       $certPath/privkey.pem;
         ssl_trusted_certificate $certPath/chain.pem;
     
         ssl_dhparam /etc/letsencrypt/dhparams/dhparam.pem;
@@ -664,9 +718,9 @@ server {
             proxy_pass http://storage:5000;
         }
 
-    	location /goapi/ {
-		    proxy_pass http://kong_upstream/;
-	    }
+        location /goapi/ {
+            proxy_pass http://kong_upstream/;
+        }
 
         location /rest {
             proxy_pass http://kong_upstream;
@@ -683,27 +737,27 @@ server {
         $([[ $with_authelia == true ]] && echo "
         include $nginxSnippetsPath/authelia-location.conf;
 
-    	location /authenticate {
-	     	include $nginxSnippetsPath/proxy.conf;
-		    proxy_pass http://authelia:9091;
-	    }")
+        location /authenticate {
+            include $nginxSnippetsPath/proxy.conf;
+            proxy_pass http://authelia:9091;
+        }")
 
         location / {
             $(
-        [[ $with_authelia == false ]] && echo "auth_basic \"Admin\";
+    [[ $with_authelia == false ]] && echo "auth_basic \"Admin\";
             auth_basic_user_file $nginx_pass_file;
-            " || echo "            
+            " || echo "                  
             include $nginxSnippetsPath/proxy.conf;
-		    include $nginxSnippetsPath/authelia-authrequest.conf;
+            include $nginxSnippetsPath/authelia-authrequest.conf;
             "
-    )
+)
             proxy_pass http://studio:3000;
         }
 }
 
 server {
     listen 80;
-	listen [::]:80;
+    listen [::]:80;
     server_name \${NGINX_SERVER_NAME};
     return 301 https://\$server_name\$request_uri;
 }
@@ -714,11 +768,11 @@ unset password confirmPassword
 if [ -n "$SUDO_USER" ]; then chown -R "$SUDO_USER": .; fi
 
 echo -e "\n🎉 Success!"
-echo "👉 Next steps:"
+echo "✅ Docker has been installed and the Docker service has been started."
+echo "✅ UFW (firewall) has been configured to allow SSH (22), HTTP (80), and HTTPS (443) traffic."
+echo -e "\n👉 Next steps:"
 echo "1. Change into the docker directory:"
 echo "   cd $directory/docker"
 echo "2. Start the services with Docker Compose:"
 echo "   docker compose up -d"
 echo "🚀 Everything should now be running!"
-
-echo -e "\n🌐 To access the dashboard over the internet, ensure your firewall allows traffic on ports 80 and 443\n"
